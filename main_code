@@ -973,3 +973,4 @@ void deleteMemory(Memory m) {
 // - Impliment chatbot integration instead of manual memory insertion
 // - Update graphics (low priority)
 // - Visualisation of memory usage
+// - AI-created inter-category connections
