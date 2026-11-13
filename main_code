@@ -1,0 +1,975 @@
+// 3D AI Memory Map v3: Processing 3 / 4 (Java mode)
+// Drag = rotate | Scroll = zoom | Click memory/category = focus | ESC = overview
+// SPACE = add sample memory | TAB = type memory, ENTER to add
+// UP / DOWN = change importance of the selected memory
+// A = switch the AI categoriser on/off (keywords are used when it is off)
+
+import java.util.*;
+import java.io.*;
+import java.net.*;
+import java.util.concurrent.*;
+import controlP5.*; //handles sliders and dropdowns
+ControlP5 cp5; //global instance
+
+// ---------- AI settings ----------
+final String MODEL = "claude-haiku-5-5";   // change if you want another model
+String apiKey = "";
+boolean useAI = true;
+volatile int pending = 0;                  // memories waiting for the AI
+ConcurrentLinkedQueue<Result> results = new ConcurrentLinkedQueue<Result>();
+String status = "";
+
+final float AGE_SPAN = 10 * 60 * 1000;     // memories fade over 10 minutes (demo speed)
+
+ArrayList<Category> cats = new ArrayList<Category>();
+ArrayList<Memory> mems = new ArrayList<Memory>();
+ArrayList<Btn> btns = new ArrayList<Btn>();
+LinkedHashMap<String, String[]> keywords = new LinkedHashMap<String, String[]>();
+
+float rotX = -0.3, rotY = 0;
+float zoom = 1, tgtZoom = 1;
+PVector curFocus = new PVector(0, 0, 0);
+PVector tgtFocus = new PVector(0, 0, 0);
+
+Memory selMem = null, pMem = null;
+Category selCat = null, pCat = null;
+float panelAnim = 0;
+final float PANEL_W = 340;
+
+boolean typing = false;
+String input = "";
+boolean editingMem = false;
+String editInput = "";
+float R1 = 260;
+int memCounter = 0;
+float pressX, pressY;
+float sx0, sy0;
+ArrayList<String> lastHits = new ArrayList<String>();
+color BG;
+
+String[] samples = {
+  "Likes pizza with extra cheese", "Studies Industrial Design at TU/e",
+  "Works on an ESP32 project with OOCSI", "Has a trip planned to Copenhagen",
+  "Plays guitar on weekends", "Prefers short answers in chat",
+  "Volunteers at a scouting camp", "Likes running in the morning",
+  "Learning Processing for a university project", "Favourite music is lo-fi and jazz",
+  "Wants cheap flights in November", "Cooks pasta every Sunday"
+};
+
+void setup() {
+  size(1000, 650, P3D);
+  surface.setLocation(50, 50);
+  textFont(createFont("SansSerif", 14));
+  sphereDetail(10);
+  BG = color(12, 14, 24);
+
+  // API key: environment variable ANTHROPIC_API_KEY, or the file data/apikey.txt
+  String envKey = System.getenv("ANTHROPIC_API_KEY");
+  if (envKey != null) apiKey = envKey.trim();
+  File kf = new File(dataPath("apikey.txt"));
+  if (kf.exists()) {
+    String[] l = loadStrings(kf);
+    if (l != null && l.length > 0) apiKey = trim(l[0]);
+  }
+  useAI = apiKey.length() > 0;
+
+  // fallback categoriser (used when the AI is off or fails)
+  keywords.put("Food",       new String[]{"pizza","cook","pasta","eat","food","cheese","recipe"});
+  keywords.put("Study",      new String[]{"study","university","tu/e","design","learning","course","exam"});
+  keywords.put("Tech",       new String[]{"esp32","oocsi","processing","code","arduino","project","ai"});
+  keywords.put("Travel",     new String[]{"trip","flight","travel","copenhagen","hotel","vacation"});
+  keywords.put("Hobbies",    new String[]{"guitar","music","jazz","game","play","running","sport"});
+  keywords.put("Social",     new String[]{"scout","volunteer","friend","camp","family","team"});
+  keywords.put("Chat style", new String[]{"prefers","answers","tone","chat","short"});
+
+  // start-up demo memories: random age and importance so the visual meaning is visible
+  for (int i = 0; i < 6; i++) {
+    Memory m = addLocal(samples[i]);
+    m.born = millis() - random(0, AGE_SPAN * 0.9);
+    m.importance = 1 + (int) random(5);
+  }
+  //initialise cp5 sliders
+  cp5 = new ControlP5(this);
+  cp5.setAutoDraw(false);
+  
+  cp5.addSlider("redValue")
+     .setPosition(780, 570)
+     .setSize(180, 10)
+     .setRange(0, 255)
+     .setValue(255)
+     .setLabel("R");
+  
+  cp5.addSlider("greenValue")
+     .setPosition(780, 592)
+     .setSize(180, 10)
+     .setRange(0, 255)
+     .setValue(255)
+     .setLabel("G");
+  
+  cp5.addSlider("blueValue")
+     .setPosition(780, 604)
+     .setSize(180, 10)
+     .setRange(0, 255)
+     .setValue(255)
+     .setLabel("B");
+}
+
+void controlEvent(ControlEvent event) {
+  if (selMem == null) return;
+
+  float r = cp5.getController("redValue").getValue();
+  float g = cp5.getController("greenValue").getValue();
+  float b = cp5.getController("blueValue").getValue();
+
+  selMem.col = color(r, g, b);
+}
+
+void updateColorSliders() {
+  float px = width - PANEL_W * panelAnim;
+  float x = px + 22;
+  
+  //spawns RGB controls
+  cp5.getController("redValue")
+     .setPosition(x, 565);
+
+  cp5.getController("greenValue")
+     .setPosition(x, 587);
+
+  cp5.getController("blueValue")
+     .setPosition(x, 609);
+
+  boolean visible = pMem != null && panelAnim > 0.95;
+
+  cp5.getController("redValue").setVisible(visible);
+  cp5.getController("greenValue").setVisible(visible);
+  cp5.getController("blueValue").setVisible(visible);
+}
+
+void draw() {
+  try {
+    drawScene();
+  } catch (Throwable t) {
+    t.printStackTrace();
+    noLoop();
+  }
+}
+
+void drawScene() {
+  background(BG);
+  lights();
+
+  // ---- results coming back from the AI thread ----
+  Result r;
+  while ((r = results.poll()) != null) {
+    pending--;
+    Memory nm;
+    if (r.error == null) {
+      nm = placeMemory(r.text, r.category, r.importance, r.reason, "AI");
+      status = "";
+    } else {
+      nm = addLocal(r.text);
+      status = "AI failed, used keywords instead (" + r.error + ")";
+    }
+    selectMemory(nm);
+  }
+
+  // ---- animation ----
+  if (!mousePressed) rotY += (selMem != null || selCat != null) ? 0.0008 : 0.002;
+  for (Category c : cats) c.update();
+  for (Memory m : mems) m.update();
+
+  if (selMem != null) tgtFocus.set(selMem.pos);
+  else if (selCat != null) tgtFocus.set(selCat.pos);
+  else tgtFocus.set(0, 0, 0);
+  curFocus.lerp(tgtFocus, 0.08);
+  zoom = lerp(zoom, tgtZoom, 0.08);
+
+  boolean isOpen = (selMem != null || selCat != null);
+  panelAnim = lerp(panelAnim, isOpen ? 1 : 0, 0.12);
+
+  // ---- 3D scene ----
+  pushMatrix();
+  translate(width / 2 - panelAnim * PANEL_W / 2, height / 2, 0);
+  scale(zoom);
+  rotateX(rotX);
+  rotateY(rotY);
+  translate(-curFocus.x, -curFocus.y, -curFocus.z);
+
+  strokeWeight(1.5);
+  for (Category c : cats) {
+    float v = catVis(c);
+    stroke(red(c.col), green(c.col), blue(c.col), 120 * v);
+    line(0, 0, 0, c.pos.x, c.pos.y, c.pos.z);
+  }
+  for (Memory m : mems) {
+    float v = vis(m);
+    strokeWeight(0.5 + m.importance * 0.4);       // thicker line = more important
+    stroke(red(m.cat.col), green(m.cat.col), blue(m.cat.col), 110 * v);
+    line(m.cat.pos.x, m.cat.pos.y, m.cat.pos.z, m.pos.x, m.pos.y, m.pos.z);
+  }
+
+  noStroke();
+  fill(255, 240, 200);
+  sphere(26);
+  sx0 = screenX(0, 0, 0);
+  sy0 = screenY(0, 0, 0);
+
+  for (Category c : cats) {
+    pushMatrix();
+    translate(c.pos.x, c.pos.y, c.pos.z);
+    fill(lerpColor(BG, c.col, catVis(c)));
+    sphere(12 + c.count * 1.2);
+    c.sx = screenX(0, 0, 0);
+    c.sy = screenY(0, 0, 0);
+    popMatrix();
+  }
+
+  for (Memory m : mems) {
+    pushMatrix();
+    translate(m.pos.x, m.pos.y, m.pos.z);
+    color base = m.col;
+
+    if (!m.interacted) {
+      float blink = (sin(millis() * 0.006) + 1) / 2;
+      base = lerpColor(m.col, color(255), blink);
+    }
+    
+    if (m == selMem) base = color(255);
+    fill(lerpColor(BG, base, vis(m)));
+    sphere(m.radius() + (m == selMem ? 3 : 0));
+    m.sx = screenX(0, 0, 0);
+    m.sy = screenY(0, 0, 0);
+    popMatrix();
+  }
+  popMatrix();
+
+  // ---- 2D overlay ----
+  hint(DISABLE_DEPTH_TEST);
+  camera();
+  noLights();
+  textAlign(CENTER, CENTER);
+
+  fill(255);
+  textSize(15);
+  text("AI MEMORY", sx0, sy0 - 40);
+
+  // pulsing ring around the core while the AI is thinking
+  if (pending > 0) {
+    noFill();
+    stroke(255, 220, 120, 200);
+    strokeWeight(2);
+    float d = 60 * zoom + 8 * sin(frameCount * 0.2);
+    ellipse(sx0, sy0, d, d);
+    noStroke();
+  }
+
+  for (Category c : cats) {
+    fill(red(c.col), green(c.col), blue(c.col), 255 * catVis(c));
+    textSize(c == selCat ? 18 : 16);
+    text(c.name + " (" + c.count + ")", c.sx, c.sy - 28 * max(1, zoom * 0.8));
+  }
+
+  // halo around important memories (4 and 5)
+  noFill();
+  strokeWeight(1.5);
+  for (Memory m : mems) {
+    if (m.importance >= 4 && vis(m) > 0.4) {
+      stroke(red(m.cat.col), green(m.cat.col), blue(m.cat.col), 90 + 50 * sin(frameCount * 0.08 + m.id));
+      float d = m.radius() * 2 * zoom + 12 + (m.importance - 4) * 6;
+      ellipse(m.sx, m.sy, d, d);
+    }
+  }
+  noStroke();
+
+  if (selCat != null) {
+    textSize(12);
+    for (Memory m : mems) {
+      if (m.cat != selCat || m == selMem) continue;
+      fill(255, 190);
+      text(shorten(m.text, 150), m.sx, m.sy - 16 - m.radius() * zoom * 0.5);
+    }
+  }
+
+  noFill();
+  stroke(255, 200);
+  strokeWeight(2);
+  float ring = 6 * sin(frameCount * 0.12);
+  if (selMem != null) {
+    float d = (selMem.radius() + 3) * 2 * zoom + 18 + ring;
+    ellipse(selMem.sx, selMem.sy, d, d);
+  } else if (selCat != null) {
+    float d = (24 + selCat.count * 2.4) * zoom + 16 + ring;
+    ellipse(selCat.sx, selCat.sy, d, d);
+  }
+  noStroke();
+
+  Object hov = (mouseX > width - PANEL_W * panelAnim) ? null : pick(mouseX, mouseY);
+  cursor(hov != null ? HAND : ARROW);
+  if (hov instanceof Memory && hov != selMem) {
+    Memory hm = (Memory) hov;
+    textAlign(CENTER, CENTER);
+    textSize(14);
+    float w = textWidth(hm.text) + 20;
+    fill(0, 200);
+    stroke(red(hm.cat.col), green(hm.cat.col), blue(hm.cat.col));
+    rectMode(CENTER);
+    rect(hm.sx, hm.sy - 30 - hm.radius(), w, 26, 6);
+    noStroke();
+    fill(255);
+    text(hm.text, hm.sx, hm.sy - 31 - hm.radius());
+    rectMode(CORNER);
+  }
+
+  // HUD
+  textAlign(LEFT, TOP);
+  textSize(13);
+  fill(160);
+  text("Drag = rotate | Scroll = zoom | Click = focus | ESC = overview | SPACE = sample | TAB = type | UP/DOWN = importance | A = AI on/off", 15, 12);
+  text("Memories: " + mems.size() + "   Categories: " + cats.size(), 15, 32);
+  if (pending > 0) {
+    fill(255, 220, 120);
+    text("AI is sorting " + pending + " memor" + (pending == 1 ? "y" : "ies") + "...", 15, 52);
+  } else if (status.length() > 0) {
+    fill(255, 140, 120);
+    text(status, 15, 52);
+  } else {
+    fill(160);
+    if (apiKey.length() == 0) text("Sorting: keywords (no API key found)", 15, 52);
+    else text("Sorting: " + (useAI ? "AI (" + MODEL + ")" : "keywords"), 15, 52);
+  }
+
+  // legend
+  fill(120);
+  textSize(12);
+  text("Dot size = importance (1-5)", 15, height - 95);
+  text("Brightness = freshness (fades over 10 min)", 15, height - 79);
+  text("Halo = important (4-5)", 15, height - 63);
+
+  if (typing) {
+    fill(255, 220, 120);
+    textSize(16);
+    text("New memory > " + input + ((frameCount / 20) % 2 == 0 ? "_" : ""), 15, height - 35);
+  }
+
+  drawPanel();
+  
+  updateColorSliders();
+  cp5.draw();
+  
+  hint(ENABLE_DEPTH_TEST);
+}
+
+// ---------------- Side panel ----------------
+
+//Draws RGB sliders to customise memory colours.
+void drawRGBSliders(Memory m, float x, float y, float w) {
+
+  colorMode(RGB, 255);
+
+  float[] values = {
+    red(m.col),
+    green(m.col),
+    blue(m.col)
+  };
+
+  String[] labels = {"R", "G", "B"};
+  color[] colours = {
+    color(255, 60, 60),
+    color(60, 255, 60),
+    color(60, 60, 255)
+  };
+
+  for (int i = 0; i < 3; i++) {
+
+    float sy = y + i * 32;
+
+    fill(150);
+    textAlign(LEFT, CENTER);
+    text(labels[i], x, sy);
+
+    float sx = x + 25;
+    float sw = w - 65;
+
+    fill(40);
+    rect(sx, sy - 4, sw, 8, 4);
+
+    fill(colours[i]);
+    rect(sx, sy - 4, sw * values[i] / 255.0, 8, 4);
+
+    fill(255);
+    ellipse(sx + sw * values[i] / 255.0,
+            sy, 12, 12);
+
+    fill(180);
+    textAlign(RIGHT, CENTER);
+    text(round(values[i]), x + w, sy);
+  }
+
+  colorMode(RGB, 255);
+}
+
+//draws panel
+void drawPanel() {
+  btns.clear();
+  if (selMem != null || selCat != null) { pMem = selMem; pCat = selCat; }
+  if (panelAnim < 0.01 || (pMem == null && pCat == null)) return;
+
+  float px = width - PANEL_W * panelAnim;
+  float x = px + 22;
+  float w = PANEL_W - 44;
+
+  fill(10, 12, 22, 240);
+  stroke(60);
+  strokeWeight(1);
+  rect(px, 0, PANEL_W + 2, height);
+  noStroke();
+  textAlign(LEFT, TOP);
+
+  if (pMem != null) {
+    Memory m = pMem;
+    fill(130);
+    textSize(12);
+    text("MEMORY #" + m.id, x, 24);
+
+    fill(m.cat.col);
+    textSize(15);
+    String back = "<  " + m.cat.name;
+    text(back, x, 46);
+    btns.add(new Btn(x, 42, textWidth(back) + 10, 24, null, m.cat));
+
+    fill(60, 100, 180);
+    rect(x, 225, 80, 26, 6);
+    fill(255);
+    textSize(14);
+    text(editingMem ? "Save" : "Edit Text", x + 14, 231);
+    btns.add(new Btn(x, 225, 90, 26, "EDIT_BTN"));
+
+    fill(180, 60, 60);
+    rect(x + 90, 225, 80, 26, 6);
+    fill(255);
+    textSize(14);
+    text("Delete", x + 112, 231);
+    btns.add(new Btn(x + 90, 225, 80, 26, "DELETE_BTN"));
+
+    fill(130);
+    textSize(12);
+    text("CONTENT", x, 90);
+    fill(255, 255, 255, 18);
+    stroke(m.cat.col);
+    rect(x - 8, 110, w + 16, 150, 8);
+    noStroke();
+    fill(255);
+    textSize(19);
+    text(m.text, x + 4, 122, w - 8, 130);
+
+    fill(130);
+    textSize(12);
+    text("CATEGORY", x, 276);
+    fill(m.cat.col);
+    textSize(15);
+    text(m.cat.name, x, 294);
+
+    fill(130);
+    textSize(12);
+    text("ADDED", x, 322);
+    fill(220);
+    textSize(15);
+    text(ago(m.born) + "  (freshness " + round(fresh(m) * 100) + "%)", x, 340);
+
+    fill(130);
+    textSize(12);
+    text("IMPORTANCE", x, 368);
+    for (int i = 0; i < 5; i++) {
+      fill(i < m.importance ? m.cat.col : color(255, 40));
+      ellipse(x + 8 + i * 22, 396, 14, 14);
+    }
+    fill(110);
+    textSize(11);
+    text("UP / DOWN arrows to change", x + 125, 390);
+
+    fill(130);
+    textSize(12);
+    text("WHY THIS CATEGORY  (" + m.source + ")", x, 424);
+    fill(220);
+    textSize(14);
+    text(m.why, x, 442, w, 56);
+
+    ArrayList<Memory> sib = new ArrayList<Memory>();
+    for (Memory o : mems) if (o.cat == m.cat) sib.add(o);
+    fill(130);
+    textSize(12);
+    text("IN THE SAME CATEGORY", x, 508);
+    memList(sib, x, 530, w, 3, m);
+
+  } else {
+    Category c = pCat;
+    fill(130);
+    textSize(12);
+    text("CATEGORY", x, 24);
+    fill(c.col);
+    textSize(26);
+    text(c.name, x, 42);
+    fill(220);
+    textSize(15);
+    text(c.count + (c.count == 1 ? " memory" : " memories"), x, 78);
+
+    ArrayList<Memory> list = new ArrayList<Memory>();
+    for (Memory o : mems) if (o.cat == c) list.add(o);
+    fill(130);
+    textSize(12);
+    text("MEMORIES (click to open)", x, 118);
+    memList(list, x, 140, w, 15, null);
+  }
+}
+
+void memList(ArrayList<Memory> list, float x, float y, float w, int max, Memory current) {
+  textSize(14);
+  int shown = min(max, list.size());
+  for (int i = 0; i < shown; i++) {
+    Memory o = list.get(i);
+    float ry = y + i * 30;
+    boolean over = mouseX > x - 8 && mouseX < x + w + 8 && mouseY > ry - 4 && mouseY < ry + 24;
+    if (o == current) fill(255, 255, 255, 40);
+    else fill(255, 255, 255, over ? 30 : 10);
+    rect(x - 8, ry - 4, w + 16, 28, 6);
+    fill(o.cat.col);
+    ellipse(x + 4, ry + 10, 4 + o.importance * 1.2, 4 + o.importance * 1.2);
+    fill(o == current ? 255 : 210);
+    text(shorten(o.text, w - 30), x + 18, ry + 2);
+    btns.add(new Btn(x - 8, ry - 4, w + 16, 28, o, null));
+  }
+  if (list.size() > shown) {
+    fill(130);
+    text("+ " + (list.size() - shown) + " more", x, y + shown * 30 + 4);
+  }
+}
+
+class Btn {
+  float x, y, w, h;
+  Memory mem;
+  Category cat;
+  String action = "";
+  Btn(float x, float y, float w, float h, Memory mem, Category cat) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.mem = mem; this.cat = cat;
+  }
+  
+  //handles string cases for editable memories
+  Btn(float x, float y, float w, float h, String action) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.action = action;
+  }
+  
+  boolean hit(float mx, float my) { return mx > x && mx < x + w && my > y && my < y + h; }
+}
+
+String shorten(String s, float maxW) {
+  if (textWidth(s) <= maxW) return s;
+  while (s.length() > 1 && textWidth(s + "...") > maxW) s = s.substring(0, s.length() - 1);
+  return s + "...";
+}
+
+String ago(float born) {
+  int s = (int) ((millis() - born) / 1000);
+  if (s < 5) return "just now";
+  if (s < 60) return s + " seconds ago";
+  if (s < 3600) return (s / 60) + " min ago";
+  return (s / 3600) + " h ago";
+}
+
+// ---------------- Visual meaning ----------------
+
+float fresh(Memory m) { return 1 - constrain((millis() - m.born) / AGE_SPAN, 0, 1); }
+
+float catVis(Category c) { return (selCat == null || c == selCat) ? 1 : 0.3; }
+
+// visibility = focus dimming x freshness (old memories fade, never fully disappear)
+float vis(Memory m) {
+  if (m == selMem) return 1;
+  float f = 0.3 + 0.7 * fresh(m);
+  if (selCat == null) return f;
+  if (m.cat == selCat) return f * (selMem == null ? 1 : 0.6);
+  return f * 0.2;
+}
+
+// ---------------- Selection ----------------
+
+void selectMemory(Memory m) {
+  selMem = m;
+  selCat = m.cat;
+  m.interacted = true;
+  tgtZoom = 2.4;
+}
+
+void selectCategory(Category c) {
+  selCat = c;
+  selMem = null;
+  tgtZoom = 1.5;
+}
+
+void deselect() {
+  selMem = null;
+  selCat = null;
+  tgtZoom = 1;
+}
+
+Object pick(float mx, float my) {
+  Memory bm = null;
+  float bd = 1e9;
+  for (Memory m : mems) {
+    float d = dist(mx, my, m.sx, m.sy);
+    float hit = 8 + m.radius() * zoom;
+    if (d < hit && d < bd) { bd = d; bm = m; }
+  }
+  if (bm != null) return bm;
+
+  Category bc = null;
+  bd = 1e9;
+  for (Category c : cats) {
+    float d = dist(mx, my, c.sx, c.sy);
+    if (d < (12 + c.count * 1.2) * zoom + 6 && d < bd) { bd = d; bc = c; }
+  }
+  if (bc != null) return bc;
+
+  if (dist(mx, my, sx0, sy0) < 26 * zoom + 8) return "core";
+  return null;
+}
+
+// ---------------- Memory logic ----------------
+
+// Entry point: send a new memory to the AI (or the keyword fallback)
+void submitMemory(String text) {
+  if (useAI) {
+    pending++;
+    status = "";
+    new Thread(new AIJob(text, catNames())).start();
+  } else {
+    selectMemory(addLocal(text));
+  }
+}
+
+String catNames() {
+  if (cats.size() == 0) return "none yet";
+  String s = "";
+  for (int i = 0; i < cats.size(); i++) s += (i > 0 ? ", " : "") + cats.get(i).name;
+  return s;
+}
+
+// keyword fallback
+Memory addLocal(String text) {
+  String catName = classify(text);
+  String why = lastHits.size() > 0
+    ? "Keywords matched: " + join(lastHits.toArray(new String[0]), ", ")
+    : "No keyword matched, so it went to Other";
+  return placeMemory(text, catName, 3, why, "keywords");
+}
+
+String classify(String text) {
+  String t = text.toLowerCase();
+  String bestCat = "Other";
+  int bestScore = 0;
+  lastHits = new ArrayList<String>();
+  for (Map.Entry<String, String[]> e : keywords.entrySet()) {
+    ArrayList<String> h = new ArrayList<String>();
+    for (String k : e.getValue()) if (t.contains(k)) h.add(k);
+    if (h.size() > bestScore) { bestScore = h.size(); bestCat = e.getKey(); lastHits = h; }
+  }
+  return bestCat;
+}
+
+Memory placeMemory(String text, String catName, int importance, String why, String source) {
+  Category c = getOrCreateCategory(catName);
+  c.count++;
+  PVector dir = c.target.copy().normalize();
+  dir.add(PVector.random3D().mult(0.9)).normalize();
+  PVector offset = dir.mult(random(70, 140));
+  Memory m = new Memory(text, c, offset, constrain(importance, 1, 5), why, source);
+  mems.add(m);
+  return m;
+}
+
+Category getOrCreateCategory(String name) {
+  for (Category c : cats) if (c.name.equalsIgnoreCase(name)) return c;
+  Category c = new Category(name);
+  cats.add(c);
+  relayout();
+  return c;
+}
+
+void relayout() {
+  int n = cats.size();
+  for (int i = 0; i < n; i++) {
+    float y = (n == 1) ? 0 : 1 - (i + 0.5) * 2.0 / n;
+    float r = sqrt(max(0, 1 - y * y));
+    float theta = i * 2.39996323;
+    cats.get(i).target = new PVector(cos(theta) * r, y, sin(theta) * r).mult(R1);
+  }
+}
+
+// ---------------- The real AI categoriser ----------------
+
+class Result {
+  String text, category, reason, error;
+  int importance = 3;
+}
+
+class AIJob implements Runnable {
+  String text, existing;
+  AIJob(String text, String existing) { this.text = text; this.existing = existing; }
+
+  public void run() {
+    Result r = new Result();
+    r.text = text;
+    try {
+      String system = "You organise the memories an AI assistant stores about a user. "
+        + "Reply with ONLY a JSON object, no other text: "
+        + "{\"category\": \"1-2 word category name\", \"importance\": 1-5, \"reason\": \"max 12 words\"}. "
+        + "Reuse an existing category when it fits; only invent a new one if none fits. "
+        + "Importance: 5 = core, long-term fact about the person, 3 = useful preference or habit, "
+        + "1 = trivial or short-lived detail.";
+
+      JSONObject body = new JSONObject();
+      body.setString("model", MODEL);
+      body.setInt("max_tokens", 200);
+      body.setString("system", system);
+      JSONArray msgs = new JSONArray();
+      JSONObject um = new JSONObject();
+      um.setString("role", "user");
+      um.setString("content", "Existing categories: " + existing + "\nNew memory: " + text);
+      msgs.append(um);
+      body.setJSONArray("messages", msgs);
+
+      URL url = new URL("https://api.anthropic.com/v1/messages");
+      HttpURLConnection con = (HttpURLConnection) url.openConnection();
+      con.setRequestMethod("POST");
+      con.setConnectTimeout(8000);
+      con.setReadTimeout(20000);
+      con.setRequestProperty("content-type", "application/json");
+      con.setRequestProperty("x-api-key", apiKey);
+      con.setRequestProperty("anthropic-version", "2023-06-01");
+      con.setDoOutput(true);
+      OutputStream os = con.getOutputStream();
+      os.write(body.toString().getBytes("UTF-8"));
+      os.close();
+
+      int code = con.getResponseCode();
+      InputStream is = (code < 400) ? con.getInputStream() : con.getErrorStream();
+      BufferedReader br = new BufferedReader(new InputStreamReader(is, "UTF-8"));
+      StringBuilder sb = new StringBuilder();
+      String line;
+      while ((line = br.readLine()) != null) sb.append(line);
+      br.close();
+      String resp = sb.toString();
+      if (code >= 400) {
+        println("API error " + code + ": " + resp);
+        throw new Exception("HTTP " + code);
+      }
+
+      JSONObject root = parseJSONObject(resp);
+      String out = root.getJSONArray("content").getJSONObject(0).getString("text");
+      int a = out.indexOf('{');
+      int b = out.lastIndexOf('}');
+      JSONObject j = parseJSONObject(out.substring(a, b + 1));
+      r.category = cleanCat(j.getString("category"));
+      r.importance = j.getInt("importance");
+      r.reason = j.getString("reason");
+    } catch (Exception e) {
+      r.error = e.toString();
+      println("AI categoriser failed: " + e);
+    }
+    results.add(r);
+  }
+}
+
+String cleanCat(String s) {
+  s = s.trim();
+  if (s.length() == 0) return "Other";
+  if (s.length() > 18) s = s.substring(0, 18).trim();
+  return s.substring(0, 1).toUpperCase() + s.substring(1);
+}
+
+// ---------------- Classes ----------------
+
+class Category {
+  String name;
+  PVector pos = new PVector(0, 0, 0);
+  PVector target = new PVector(0, 0, 0);
+  color col;
+  int count = 0;
+  float sx, sy;
+
+  Category(String name) {
+    this.name = name;
+    pushStyle();
+    colorMode(HSB, 360, 100, 100);
+    col = color((cats.size() * 57 + 20) % 360, 60, 100);
+    popStyle();
+  }
+  void update() { pos.lerp(target, 0.06); }
+}
+
+class Memory {
+  int id;
+  String text, why, source;
+  Category cat;
+  PVector offset;
+  PVector pos = new PVector(0, 0, 0);
+  int importance;
+  float born = millis();
+  float sx, sy;
+  color col;
+  boolean interacted = false;
+  
+  Memory(String text, Category cat, PVector offset, int importance, String why, String source) {
+    this.id = ++memCounter;
+    this.text = text;
+    this.cat = cat;
+    this.offset = offset;
+    this.importance = importance;
+    this.why = why;
+    this.source = source;
+    this.col = cat.col;
+  }
+  float radius() { return 3 + importance * 1.8; }
+  void update() { pos.lerp(PVector.add(cat.pos, offset), 0.05); }
+}
+
+// ---------------- Input ----------------
+
+void mousePressed() {
+  pressX = mouseX;
+  pressY = mouseY;
+}
+
+void mouseDragged() {
+  if (mouseX > width - PANEL_W * panelAnim) return;
+  rotY += (mouseX - pmouseX) * 0.01;
+  rotX -= (mouseY - pmouseY) * 0.01;
+}
+
+void mouseReleased() {
+  if (dist(mouseX, mouseY, pressX, pressY) > 5) return;
+
+  for (Btn b : btns) {
+    if (b.hit(mouseX, mouseY)) {
+      if (b.action.equals("DELETE_BTN") && selMem != null) {
+        deleteMemory(selMem);
+        return;
+      } else if (b.action.equals("EDIT_BTN") && selMem != null) {
+        editingMem = !editingMem;
+        if (editingMem) {
+          editInput = selMem.text;
+        } else {
+          // Save changes made during edit
+          selMem.text = editInput;
+        }
+        return;
+      }
+      
+      if (b.mem != null) selectMemory(b.mem);
+      else if (b.cat != null) selectCategory(b.cat);
+      return;
+    }
+  }
+  if (mouseX > width - PANEL_W * panelAnim) return;
+
+  Object p = pick(mouseX, mouseY);
+  if (p instanceof Memory) {
+    editingMem = false; // reset edit mode when clicking a new memory
+    selectMemory((Memory) p);
+  } else if (p instanceof Category) {
+    editingMem = false;
+    selectCategory((Category) p);
+  } else {
+    editingMem = false;
+    deselect();
+  }
+}
+
+void mouseWheel(MouseEvent e) {
+  tgtZoom *= (e.getCount() > 0) ? 0.93 : 1.07;
+  tgtZoom = constrain(tgtZoom, 0.3, 4);
+}
+
+void keyPressed() {
+  if (key == CODED) {
+    if (selMem != null && !editingMem && keyCode == UP) selMem.importance = min(5, selMem.importance + 1);
+    if (selMem != null && !editingMem && keyCode == DOWN) selMem.importance = max(1, selMem.importance - 1);
+    return;
+  }
+  if (key == ESC) {
+    key = 0;
+    typing = false;
+    editingMem = false;
+    deselect();
+    return;
+  }
+  
+  // If we are actively editing an existing memory's text
+  if (editingMem) {
+    if (key == ENTER || key == RETURN) {
+      if (editInput.trim().length() > 0) {
+        selMem.text = editInput.trim();
+      }
+      editingMem = false;
+    } else if (key == BACKSPACE) {
+      if (editInput.length() > 0) editInput = editInput.substring(0, editInput.length() - 1);
+    } else if (key >= 32) {
+      editInput += key;
+    }
+    // Also visually mirror text changes live into the object while typing
+    if (selMem != null && editInput.length() > 0) {
+      selMem.text = editInput;
+    }
+    return;
+  }
+
+  if (key == TAB) { typing = !typing; input = ""; return; }
+
+  if (typing) {
+    if (key == ENTER || key == RETURN) {
+      if (input.trim().length() > 0) submitMemory(input.trim());
+      input = "";
+      typing = false;
+    } else if (key == BACKSPACE) {
+      if (input.length() > 0) input = input.substring(0, input.length() - 1);
+    } else if (key >= 32) {
+      input += key;
+    }
+  } else if (key == ' ') {
+    submitMemory(samples[(int) random(samples.length)]);
+  } else if (key == 'a' || key == 'A') {
+    if (apiKey.length() > 0) useAI = !useAI;
+  }
+}
+
+//handles deleting memories
+void deleteMemory(Memory m) {
+  // Decrement category count
+  m.cat.count--;
+  
+  // Remove from lists
+  mems.remove(m);
+  
+  // Clean up category if it's now empty
+  if (m.cat.count <= 0) {
+    cats.remove(m.cat);
+    relayout();
+    if (selCat == m.cat) selCat = null;
+  }
+  
+  // Deselect
+  editingMem = false;
+  selMem = null;
+  tgtZoom = 1;
+}
+
+//To Do:
+// - Move memories
+// - Merge memories
+// - Merge categories
+// - AI suggestions in seperate panel
+// - Switch to Gemini
+// - Impliment chatbot integration instead of manual memory insertion
+// - Update graphics (low priority)
+// - Visualisation of memory usage
